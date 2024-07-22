@@ -14,6 +14,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Dynamic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
@@ -42,17 +43,14 @@ internal class MongoExpressionRewriter : ExpressionVisitor
         var source = node.Arguments[0];
         var lambda = (LambdaExpression)RemoveQuotes(node.Arguments[1]);
 
-        // create a new lambda body using the same arguments, omitting SelectSome so that the MongoDB driver can translate it
-        var newLambdaBody = VisitSelectSome(lambda);
-        var newLambda = Expression.Lambda(newLambdaBody, lambda.Parameters);
+        var newLambda = (LambdaExpression) VisitSelectDynamic(lambda);
 
-        var selectMethod = typeof(Queryable).GetMethods().First(m => m.Name == "Select");
-        var sourceType = source.Type.GetGenericArguments()[0];
-        var newLambdaType = newLambda.ReturnType;
-
-        var result = Expression.Call(selectMethod.MakeGenericMethod(sourceType, newLambdaType), source, newLambda);
-
-        return result;
+        return Expression.Call(
+            typeof(Queryable),
+            "Select",
+            new[] { source.Type.GetGenericArguments()[0], newLambda.Type.GetGenericArguments()[1] },
+            source,
+            newLambda);
     }
 
     private static Expression RemoveQuotes(Expression e)
@@ -146,4 +144,85 @@ internal class MongoExpressionRewriter : ExpressionVisitor
         public string Name { get; set; }
         public double Area { get; set; }
     }
+
+
+    private static Expression VisitSelectDynamic(LambdaExpression lambda)
+    {
+        var body = lambda.Body;
+
+        if (body is MemberInitExpression memberInit && memberInit.NewExpression.Type.Name.StartsWith("SelectSome"))
+        {
+            var varExpando = Expression.Variable(typeof(ExpandoObject), "expando");
+            var newExpando = Expression.New(typeof(ExpandoObject));
+
+            var newBindings = new List<Expression> { Expression.Assign(varExpando, newExpando) };
+
+            var containerBinding = memberInit.Bindings
+                .OfType<MemberAssignment>()
+                .FirstOrDefault(b => b.Member.Name == "Container");
+
+            if (containerBinding != null)
+            {
+                var containerInit = (MemberInitExpression)containerBinding.Expression;
+                var containerBindings = containerInit.Bindings.OfType<MemberAssignment>().ToList();
+
+                for (int i = 0; i < containerBindings.Count; i++)
+                {
+                    MemberAssignment currentBinding = containerBindings[i];
+
+                    if (currentBinding.Member.Name == "Name")
+                    {
+                        var valueBinding = containerBindings[i + 1];
+
+                        var propertyName = (ConstantExpression)currentBinding.Expression;
+                        var propertyValue = valueBinding.Expression;
+                        var propertyValueAsObject = Expression.Convert(propertyValue, typeof(object));
+                        var addMethod = typeof(IDictionary<string, object>).GetMethod("Add");
+                        var addProperty = Expression.Call(
+                            Expression.Convert(varExpando, typeof(IDictionary<string, object>)),
+                            addMethod,
+                            propertyName,
+                            propertyValueAsObject);
+
+                        newBindings.Add(addProperty);
+                    }
+                    else if (currentBinding.Member.Name == "Value")
+                    {
+                    }
+                    else if (currentBinding.Member.Name.StartsWith("Next"))
+                    {
+                        if (currentBinding.Expression is MemberInitExpression nextInit &&
+                            nextInit.Bindings[0] is MemberAssignment keyBinding &&
+                            nextInit.Bindings[1] is MemberAssignment valueBinding)
+                        {
+                            var propertyName = (ConstantExpression)keyBinding.Expression;
+                            var propertyValue = valueBinding.Expression;
+                            var propertyValueAsObject = Expression.Convert(propertyValue, typeof(object));
+                            var addMethod = typeof(IDictionary<string, object>).GetMethod("Add");
+                            var addProperty = Expression.Call(
+                                Expression.Convert(varExpando, typeof(IDictionary<string, object>)),
+                                addMethod,
+                                propertyName,
+                                propertyValueAsObject);
+
+                            newBindings.Add(addProperty);
+                        }
+                    }
+                    else
+                    {
+                        throw new NotSupportedException($"Unsupported binding type: {currentBinding.Member.Name}");
+                    }
+                }
+
+                newBindings.Add(varExpando);
+                var block = Expression.Block(new[] { varExpando }, newBindings);
+
+                var lambdaParameters = lambda.Parameters.ToArray();
+                return Expression.Lambda(block, lambdaParameters);
+            }
+        }
+
+        return body;
+    }
+
 }
